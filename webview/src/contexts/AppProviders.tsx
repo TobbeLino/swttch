@@ -32,6 +32,7 @@ import { SessionState } from '../types';
 import type { LoadedMessageDto } from '../types';
 import { MessageType } from '@/shared';
 import { isValidInputMode } from '@/types/chatInput';
+import { whenScrollQuiet } from '@/utils/scrollGate';
 
 interface AppProvidersProps {
   children: ReactNode;
@@ -226,10 +227,16 @@ export function SessionLoader({ children }: { children: ReactNode }) {
           if (!document.hidden) void Promise.resolve(send(MessageType.MARK_SESSION_READ, { sessionId: sid })).catch(() => undefined);
         } else if (isNewestPage) {
           loadMessages(rawMessages, !!hasMore);
-        } else if (prepend) {
-          prependOlderMessages(rawMessages, !!hasMore, beforeUuid, !!reached);
-        } else if (append) {
-          appendNewerMessages(rawMessages, !!reached);
+        } else if (prepend || append) {
+          // On a phone, adding a page while the user is scrolling shifts the content, and iOS may undo the scroll
+          // correction that keeps it in place. So the page is only added once scrolling has stopped (see
+          // utils/scrollGate). If the user switches to another session while the page waits, it is discarded,
+          // just like the stale-response guard above does for pages that arrive late.
+          whenScrollQuiet(() => {
+            if (sid && sid !== currentSessionIdRef.current) return;
+            if (prepend) prependOlderMessages(rawMessages, !!hasMore, beforeUuid, !!reached);
+            else appendNewerMessages(rawMessages, !!reached);
+          });
         } else {
           jumpToMessages(rawMessages, !!hasMore, windowConfigRef.current);
         }

@@ -91,6 +91,7 @@ import { carriedSend } from './SendIndex/carriedSend';
 import { useSessionSends } from '@/hooks/useSessionSends';
 import type { SessionSend } from '@/shared';
 import { rectMetrics } from '@/utils/zoomRects';
+import { noteScroll, noteTouch, scrollGateBusy, whenScrollQuiet } from '@/utils/scrollGate';
 
 /** Stable empty list, so a session with no index yet does not re-render everything each time. */
 const EMPTY_SENDS: SessionSend[] = [];
@@ -328,6 +329,8 @@ function ChatPageContent() {
   const reconcileRef = useRef<() => void>(() => {});
   // The last page asked for and when, so a page that adds nothing new is not asked for again at once.
   const lastRequestRef = useRef<{ key: string; at: number } | null>(null);
+  // Set while a postponed reconcile is queued, so it is only queued once (see reconcile and utils/scrollGate).
+  const reconcileQueuedRef = useRef(false);
 
   useEffect(() => {
     hasMoreOlderRef.current = hasMoreOlder;
@@ -479,7 +482,9 @@ function ChatPageContent() {
     // The page is drawn a piece at a time after it has arrived (see `startTransition` in useChatStream), so "no
     // longer loading" is said the same way: it is written to the screen with the page, not ahead of it.
     return request(currentSessionId).finally(() => {
-      startTransition(() => setLoadingPage(null));
+      // If the page itself is waiting for scrolling to stop (utils/scrollGate), this is queued after it. The page and
+      // the end of loading are then applied together, and the loading guard is not released before the page is shown.
+      whenScrollQuiet(() => startTransition(() => setLoadingPage(null)));
     });
   }, [currentSessionId, captureScrollAnchor]);
 
@@ -577,6 +582,19 @@ function ChatPageContent() {
    */
   const reconcile = useCallback(() => {
     if (!scrollContainerRef.current || !currentSessionId || isLoadingMoreRef.current) return;
+    // On a phone, only load or drop pages once scrolling has stopped. While a finger is on the screen or the page is
+    // still coasting, iOS may undo the scroll correction that keeps the content in place, and the content jumps by a
+    // whole page (#747, see utils/scrollGate).
+    if (scrollGateBusy()) {
+      if (!reconcileQueuedRef.current) {
+        reconcileQueuedRef.current = true;
+        whenScrollQuiet(() => {
+          reconcileQueuedRef.current = false;
+          reconcileRef.current();
+        });
+      }
+      return;
+    }
     // Entries just drawn are not at their final height yet (a long reply is folded a frame after it lands, so
     // the entries above the reader shrink by hundreds of pixels), and the reader's range measured on them
     // is off by whole pages: a page loaded for it was dropped again for the range measured a frame later,
@@ -635,6 +653,8 @@ function ChatPageContent() {
     const el = scrollContainerRef.current;
     if (!el) return;
 
+    noteScroll(); // lets page changes wait until scrolling stops (utils/scrollGate)
+
     // 1. Debounced save scroll position to localStorage
     rememberScrollPosition();
 
@@ -644,6 +664,26 @@ function ChatPageContent() {
     // 3. Note the entry in view, so a page added above it does not move the reader (see useScrollAnchor).
     captureScrollAnchor();
   }, [rememberScrollPosition, reconcile, captureScrollAnchor]);
+
+  // Track whether a finger is on the chat, so page changes can wait until scrolling stops (utils/scrollGate). Lifting
+  // the last finger counts as a scroll, so the coasting that may follow is waited out too.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const down = () => noteTouch(true);
+    const up = (e: TouchEvent) => {
+      if (e.touches.length === 0) noteTouch(false);
+    };
+    el.addEventListener('touchstart', down, { passive: true });
+    el.addEventListener('touchend', up, { passive: true });
+    el.addEventListener('touchcancel', up, { passive: true });
+    return () => {
+      el.removeEventListener('touchstart', down);
+      el.removeEventListener('touchend', up);
+      el.removeEventListener('touchcancel', up);
+      noteTouch(false);
+    };
+  }, [scrollContainerRef]);
 
   // After the held messages change, or a request ends, ask again: the page that just arrived may not
   // have been enough, and no scroll event is coming to say so.
